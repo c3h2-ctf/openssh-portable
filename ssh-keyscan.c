@@ -29,6 +29,7 @@
 #include <poll.h>
 #endif
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -96,11 +97,7 @@ int ncon;
  * associated with file descriptor n is held in fdcon[n].
  */
 typedef struct Connection {
-	u_char c_status;	/* State of connection on this file desc. */
-#define CS_UNUSED 0		/* File descriptor unused */
-#define CS_CON 1		/* Waiting to connect/read greeting */
-#define CS_SIZE 2		/* Waiting to read initial packet size */
-#define CS_KEYS 3		/* Waiting to read public key packet */
+	bool c_in_use;		/* State of connection on this file desc. */
 	int c_fd;		/* Quick lookup: c->c_fd == c - fdcon */
 	int c_plen;		/* Packet length field for ssh packet */
 	int c_len;		/* Total bytes which must be read. */
@@ -401,12 +398,12 @@ conalloc(char *iname, char *oname, int keytype)
 
 	if (s >= maxfd)
 		fatal("conalloc: fdno %d too high", s);
-	if (fdcon[s].c_status)
+	if (fdcon[s].c_in_use)
 		fatal("conalloc: attempt to reuse fdno %d", s);
 
 	debug3_f("oname %s kt %d", oname, keytype);
 	fdcon[s].c_fd = s;
-	fdcon[s].c_status = CS_CON;
+	fdcon[s].c_in_use = true;
 	fdcon[s].c_namebase = namebase;
 	fdcon[s].c_name = name;
 	fdcon[s].c_namelist = namelist;
@@ -427,13 +424,11 @@ conalloc(char *iname, char *oname, int keytype)
 static void
 confree(int s)
 {
-	if (s >= maxfd || fdcon[s].c_status == CS_UNUSED)
+	if (s >= maxfd || !fdcon[s].c_in_use)
 		fatal("confree: attempt to free bad fdno %d", s);
 	free(fdcon[s].c_namebase);
 	free(fdcon[s].c_output_name);
-	if (fdcon[s].c_status == CS_KEYS)
-		free(fdcon[s].c_data);
-	fdcon[s].c_status = CS_UNUSED;
+	fdcon[s].c_in_use = false;
 	fdcon[s].c_keytype = 0;
 	if (fdcon[s].c_ssh) {
 		ssh_packet_close(fdcon[s].c_ssh);
@@ -445,15 +440,6 @@ confree(int s)
 	read_wait[s].fd = -1;
 	read_wait[s].events = 0;
 	ncon--;
-}
-
-static void
-contouch(int s)
-{
-	TAILQ_REMOVE(&tq, &fdcon[s], c_link);
-	monotime_ts(&fdcon[s].c_ts);
-	fdcon[s].c_ts.tv_sec += timeout;
-	TAILQ_INSERT_TAIL(&tq, &fdcon[s], c_link);
 }
 
 static int
@@ -475,6 +461,10 @@ congreet(int s)
 	char remote_version[sizeof buf];
 	size_t bufsiz;
 	con *c = &fdcon[s];
+
+	if (!c->c_in_use) {
+		return;
+	}
 
 	/* send client banner */
 	n = snprintf(buf, sizeof buf, "SSH-%d.%d-OpenSSH-keyscan\r\n",
@@ -543,41 +533,6 @@ congreet(int s)
 }
 
 static void
-conread(int s)
-{
-	con *c = &fdcon[s];
-	size_t n;
-
-	if (c->c_status == CS_CON) {
-		congreet(s);
-		return;
-	}
-	n = atomicio(read, s, c->c_data + c->c_off, c->c_len - c->c_off);
-	if (n == 0) {
-		error("read (%s): %s", c->c_name, strerror(errno));
-		confree(s);
-		return;
-	}
-	c->c_off += n;
-
-	if (c->c_off == c->c_len)
-		switch (c->c_status) {
-		case CS_SIZE:
-			c->c_plen = htonl(c->c_plen);
-			c->c_len = c->c_plen + 8 - (c->c_plen & 7);
-			c->c_off = 0;
-			c->c_data = xmalloc(c->c_len);
-			c->c_status = CS_KEYS;
-			break;
-		default:
-			fatal("conread: invalid status %d", c->c_status);
-			break;
-		}
-
-	contouch(s);
-}
-
-static void
 conloop(void)
 {
 	struct timespec seltime, now;
@@ -600,7 +555,7 @@ conloop(void)
 		if (read_wait[i].revents & (POLLHUP|POLLERR|POLLNVAL))
 			confree(i);
 		else if (read_wait[i].revents & (POLLIN|POLLHUP))
-			conread(i);
+			congreet(i);
 	}
 
 	c = TAILQ_FIRST(&tq);
